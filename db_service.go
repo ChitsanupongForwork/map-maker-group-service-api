@@ -20,11 +20,12 @@ import (
 )
 
 const (
-	databaseDemoFleetSize       = 1_000
-	databaseSimulationBatchSize = 40
-	databaseMigrationVersion    = "001_fleet_realtime_postgres"
-	realtimeMigrationVersion    = "002_fleet_change_notifications"
-	realtimeNotificationChannel = "fleet_vehicle_changed"
+	databaseDemoFleetSize            = 1_000
+	databaseSimulationBatchSize      = 40
+	databaseMigrationVersion         = "001_fleet_realtime_postgres"
+	realtimeMigrationVersion         = "002_fleet_change_notifications"
+	positionEventFixMigrationVersion = "003_fix_position_event_live_state"
+	realtimeNotificationChannel      = "fleet_vehicle_changed"
 )
 
 //go:embed migrations/001_fleet_realtime_postgres.sql
@@ -32,6 +33,9 @@ var databaseMigrationSQL string
 
 //go:embed migrations/002_fleet_change_notifications.sql
 var realtimeMigrationSQL string
+
+//go:embed migrations/003_fix_position_event_live_state.sql
+var positionEventFixMigrationSQL string
 
 type databaseDemoVehicle struct {
 	code, label, driver, phone, plate, make, model, origin, destination, status string
@@ -132,7 +136,10 @@ func (r *databaseRepository) ensureSchema(ctx context.Context) error {
 	if err := r.applyMigration(ctx, databaseMigrationVersion, databaseMigrationSQL, true); err != nil {
 		return err
 	}
-	return r.applyMigration(ctx, realtimeMigrationVersion, realtimeMigrationSQL, false)
+	if err := r.applyMigration(ctx, realtimeMigrationVersion, realtimeMigrationSQL, false); err != nil {
+		return err
+	}
+	return r.applyMigration(ctx, positionEventFixMigrationVersion, positionEventFixMigrationSQL, false)
 }
 
 func (r *databaseRepository) applyMigration(ctx context.Context, version, migrationSQL string, recoverInitialSchema bool) error {
