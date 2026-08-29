@@ -68,8 +68,8 @@ BEGIN
   ) VALUES (
     NEW.vehicle_id, NEW.tenant_id, NEW.device_id, NEW.event_id, NEW.device_time,
     NEW.received_at, NEW.received_at, NEW.valid, NEW.latitude, NEW.longitude,
-    NEW.speed_kph, NEW.course_deg, NEW.ignition, NEW.motion, 'online',
-    CASE WHEN COALESCE(NEW.motion, false) OR NEW.speed_kph > 0 THEN 'moving' ELSE 'idle' END
+    NEW.speed_kph, NEW.course_deg, NEW.ignition, NEW.motion, 'online'::connection_status,
+    (CASE WHEN COALESCE(NEW.motion, false) OR NEW.speed_kph > 0 THEN 'moving' ELSE 'idle' END)::operational_status
   ) ON CONFLICT (vehicle_id) DO UPDATE SET
     device_id = EXCLUDED.device_id,
     latest_event_id = EXCLUDED.latest_event_id,
