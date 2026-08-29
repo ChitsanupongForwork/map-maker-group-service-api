@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +22,11 @@ import (
 const (
 	databaseDemoFleetSize       = 1_000
 	databaseSimulationBatchSize = 40
+	databaseMigrationVersion    = "001_fleet_realtime_postgres"
 )
+
+//go:embed migrations/001_fleet_realtime_postgres.sql
+var databaseMigrationSQL string
 
 type databaseDemoVehicle struct {
 	code, label, driver, phone, plate, make, model, origin, destination, status string
@@ -104,6 +109,32 @@ func newDatabaseRepository(ctx context.Context) (*databaseRepository, error) {
 
 func databaseQuoteIdentifier(value string) string {
 	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+}
+
+func (r *databaseRepository) ensureSchema(ctx context.Context) error {
+	if _, err := r.pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version TEXT PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`); err != nil {
+		return fmt.Errorf("create schema migration table: %w", err)
+	}
+
+	var applied bool
+	if err := r.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, databaseMigrationVersion).Scan(&applied); err != nil {
+		return fmt.Errorf("read schema migrations: %w", err)
+	}
+	if applied {
+		return nil
+	}
+
+	if _, err := r.pool.Exec(ctx, databaseMigrationSQL, pgx.QueryExecModeSimpleProtocol); err != nil {
+		return fmt.Errorf("apply database migration: %w", err)
+	}
+	if _, err := r.pool.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, databaseMigrationVersion); err != nil {
+		return fmt.Errorf("record schema migration: %w", err)
+	}
+	return nil
 }
 
 func (r *databaseRepository) ensureDemoFleet(ctx context.Context) (bool, error) {
@@ -380,6 +411,9 @@ func main() {
 		log.Fatal(err)
 	}
 	defer repository.pool.Close()
+	if err := repository.ensureSchema(ctx); err != nil {
+		log.Fatal("prepare database schema: ", err)
+	}
 
 	seeded, err := repository.ensureDemoFleet(ctx)
 	if err != nil {
