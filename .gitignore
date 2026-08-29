@@ -1,0 +1,6 @@
+.env
+.env.*
+!.env.example
+.appdeploy
+fleet-api.exe
+bin/

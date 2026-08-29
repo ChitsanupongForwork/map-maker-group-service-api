@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: map-maker-group-service-api
+    runtime: go
+    buildCommand: go build -o app .
+    startCommand: ./app
+    healthCheckPath: /healthz
+    envVars:
+      - key: DEMO_MODE
+        value: "true"
+      - key: FRONTEND_ORIGINS
+        value: https://map-maker-group.vercel.app
