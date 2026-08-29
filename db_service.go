@@ -128,6 +128,23 @@ func (r *databaseRepository) ensureSchema(ctx context.Context) error {
 		return nil
 	}
 
+	// A previous startup can finish the SQL transaction but be interrupted
+	// before recording its version. Treat the established fleet read model as
+	// authoritative so a restart never attempts to create its enum types again.
+	var fleetSchemaExists bool
+	if err := r.pool.QueryRow(ctx, `
+		SELECT to_regclass('vehicles') IS NOT NULL
+		   AND to_regclass('vehicle_live_states') IS NOT NULL
+		   AND to_regclass('position_events') IS NOT NULL`).Scan(&fleetSchemaExists); err != nil {
+		return fmt.Errorf("check fleet schema: %w", err)
+	}
+	if fleetSchemaExists {
+		if _, err := r.pool.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING`, databaseMigrationVersion); err != nil {
+			return fmt.Errorf("record existing schema migration: %w", err)
+		}
+		return nil
+	}
+
 	if _, err := r.pool.Exec(ctx, databaseMigrationSQL, pgx.QueryExecModeSimpleProtocol); err != nil {
 		return fmt.Errorf("apply database migration: %w", err)
 	}
