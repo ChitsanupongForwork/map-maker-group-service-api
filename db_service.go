@@ -23,10 +23,15 @@ const (
 	databaseDemoFleetSize       = 1_000
 	databaseSimulationBatchSize = 40
 	databaseMigrationVersion    = "001_fleet_realtime_postgres"
+	realtimeMigrationVersion    = "002_fleet_change_notifications"
+	realtimeNotificationChannel = "fleet_vehicle_changed"
 )
 
 //go:embed migrations/001_fleet_realtime_postgres.sql
 var databaseMigrationSQL string
+
+//go:embed migrations/002_fleet_change_notifications.sql
+var realtimeMigrationSQL string
 
 type databaseDemoVehicle struct {
 	code, label, driver, phone, plate, make, model, origin, destination, status string
@@ -73,7 +78,11 @@ func databaseDemoVehicleAt(index int) databaseDemoVehicle {
 	}
 }
 
-type databaseRepository struct{ pool *pgxpool.Pool }
+type databaseRepository struct {
+	pool        *pgxpool.Pool
+	databaseURL string
+	schema      string
+}
 
 func newDatabaseRepository(ctx context.Context) (*databaseRepository, error) {
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -104,7 +113,7 @@ func newDatabaseRepository(ctx context.Context) (*databaseRepository, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
-	return &databaseRepository{pool: pool}, nil
+	return &databaseRepository{pool: pool, databaseURL: databaseURL, schema: schema}, nil
 }
 
 func databaseQuoteIdentifier(value string) string {
@@ -120,36 +129,45 @@ func (r *databaseRepository) ensureSchema(ctx context.Context) error {
 		return fmt.Errorf("create schema migration table: %w", err)
 	}
 
+	if err := r.applyMigration(ctx, databaseMigrationVersion, databaseMigrationSQL, true); err != nil {
+		return err
+	}
+	return r.applyMigration(ctx, realtimeMigrationVersion, realtimeMigrationSQL, false)
+}
+
+func (r *databaseRepository) applyMigration(ctx context.Context, version, migrationSQL string, recoverInitialSchema bool) error {
 	var applied bool
-	if err := r.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, databaseMigrationVersion).Scan(&applied); err != nil {
+	if err := r.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, version).Scan(&applied); err != nil {
 		return fmt.Errorf("read schema migrations: %w", err)
 	}
 	if applied {
 		return nil
 	}
 
-	// A previous startup can finish the SQL transaction but be interrupted
+	// A previous startup can finish the initial SQL transaction but be interrupted
 	// before recording its version. Treat the established fleet read model as
 	// authoritative so a restart never attempts to create its enum types again.
-	var fleetSchemaExists bool
-	if err := r.pool.QueryRow(ctx, `
-		SELECT to_regclass('vehicles') IS NOT NULL
-		   AND to_regclass('vehicle_live_states') IS NOT NULL
-		   AND to_regclass('position_events') IS NOT NULL`).Scan(&fleetSchemaExists); err != nil {
-		return fmt.Errorf("check fleet schema: %w", err)
-	}
-	if fleetSchemaExists {
-		if _, err := r.pool.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING`, databaseMigrationVersion); err != nil {
-			return fmt.Errorf("record existing schema migration: %w", err)
+	if recoverInitialSchema {
+		var fleetSchemaExists bool
+		if err := r.pool.QueryRow(ctx, `
+			SELECT to_regclass('vehicles') IS NOT NULL
+			   AND to_regclass('vehicle_live_states') IS NOT NULL
+			   AND to_regclass('position_events') IS NOT NULL`).Scan(&fleetSchemaExists); err != nil {
+			return fmt.Errorf("check fleet schema: %w", err)
 		}
-		return nil
+		if fleetSchemaExists {
+			if _, err := r.pool.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING`, version); err != nil {
+				return fmt.Errorf("record existing schema migration: %w", err)
+			}
+			return nil
+		}
 	}
 
-	if _, err := r.pool.Exec(ctx, databaseMigrationSQL, pgx.QueryExecModeSimpleProtocol); err != nil {
-		return fmt.Errorf("apply database migration: %w", err)
+	if _, err := r.pool.Exec(ctx, migrationSQL, pgx.QueryExecModeSimpleProtocol); err != nil {
+		return fmt.Errorf("apply %s migration: %w", version, err)
 	}
-	if _, err := r.pool.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, databaseMigrationVersion); err != nil {
-		return fmt.Errorf("record schema migration: %w", err)
+	if _, err := r.pool.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, version); err != nil {
+		return fmt.Errorf("record %s migration: %w", version, err)
 	}
 	return nil
 }
@@ -216,11 +234,24 @@ func (r *databaseRepository) insertDemoVehicle(ctx context.Context, tx pgx.Tx, t
 	}
 	_, err := tx.Exec(ctx, `
 		INSERT INTO vehicle_live_states (vehicle_id, tenant_id, device_id, driver_id, latest_event_id, device_time, received_at, last_seen_at, valid, latitude, longitude, speed_kph, course_deg, ignition, motion, connection_status, operational_status)
-		VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, now(), now(), now(), true, $6, $7, $8, $9, $10, $11, $12::connection_status, $13::operational_status)`, vehicleID, tenantID, deviceID, driverID, eventID, item.lat, item.lng, item.speed, item.heading, ignition, item.status == "moving", connection, operational)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, now(), now(), now(), true, $6, $7, $8, $9, $10, $11, $12::connection_status, $13::operational_status)
+		ON CONFLICT (vehicle_id) DO UPDATE SET driver_id = EXCLUDED.driver_id`, vehicleID, tenantID, deviceID, driverID, eventID, item.lat, item.lng, item.speed, item.heading, ignition, item.status == "moving", connection, operational)
 	return err
 }
 
 func (r *databaseRepository) snapshot(ctx context.Context) ([]vehicle, error) {
+	return r.queryFleet(ctx, `WHERE v.active ORDER BY v.code`)
+}
+
+func (r *databaseRepository) vehicleSnapshot(ctx context.Context, vehicleID string) (*vehicle, error) {
+	items, err := r.queryFleet(ctx, `WHERE v.active AND v.id = $1::uuid`, vehicleID)
+	if err != nil || len(items) == 0 {
+		return nil, err
+	}
+	return &items[0], nil
+}
+
+func (r *databaseRepository) queryFleet(ctx context.Context, whereClause string, args ...any) ([]vehicle, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT v.id::text, v.tenant_id::text, COALESCE(ls.device_id::text, ''), COALESCE(ls.driver_id::text, ''), v.code, v.label,
 			CASE WHEN ls.connection_status = 'offline' THEN 'offline' WHEN ls.operational_status = 'moving' THEN 'moving' ELSE 'stopped' END,
@@ -232,7 +263,7 @@ func (r *databaseRepository) snapshot(ctx context.Context) ([]vehicle, error) {
 		LEFT JOIN vehicle_live_states ls ON ls.vehicle_id = v.id
 		LEFT JOIN drivers d ON d.id = ls.driver_id
 		LEFT JOIN LATERAL (SELECT origin_name, destination_name FROM trips WHERE vehicle_id = v.id AND status = 'active' ORDER BY started_at DESC LIMIT 1) trip ON true
-		WHERE v.active ORDER BY v.code`)
+		`+whereClause, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +282,7 @@ func (r *databaseRepository) snapshot(ctx context.Context) ([]vehicle, error) {
 }
 
 func (r *databaseRepository) recordPosition(ctx context.Context, item vehicle) error {
-	connection, operational, ignition := databaseStatesFor(item.Status)
+	_, _, ignition := databaseStatesFor(item.Status)
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
@@ -263,13 +294,6 @@ func (r *databaseRepository) recordPosition(ctx context.Context, item vehicle) e
 		INSERT INTO position_events (received_at, tenant_id, vehicle_id, device_id, sequence_no, device_time, fix_time, valid, latitude, longitude, accuracy_m, speed_kph, course_deg, ignition, motion, satellites, hdop, attributes, raw_payload)
 		VALUES (now(), $1::uuid, $2::uuid, $3::uuid, extract(epoch FROM now())::bigint, now(), now(), true, $4, $5, 8, $6, $7, $8, $9, 12, 0.8, '{}'::jsonb, '{}'::jsonb)
 		RETURNING event_id::text`, item.TenantID, item.ID, item.DeviceID, item.Lat, item.Lng, item.SpeedKph, item.HeadingDeg, ignition, item.Status == "moving").Scan(&eventID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE vehicle_live_states SET latest_event_id = $2::uuid, device_time = now(), received_at = now(), last_seen_at = now(), valid = true,
-			latitude = $3, longitude = $4, speed_kph = $5, course_deg = $6, ignition = $7, motion = $8,
-			connection_status = $9::connection_status, operational_status = $10::operational_status, version = version + 1, updated_at = now()
-		WHERE vehicle_id = $1::uuid`, item.ID, eventID, item.Lat, item.Lng, item.SpeedKph, item.HeadingDeg, ignition, item.Status == "moving", connection, operational); err != nil {
 		return err
 	}
 	payload, _ := json.Marshal(item)
@@ -348,6 +372,86 @@ func (s *databaseSimulator) publish(payload []byte) {
 	}
 }
 
+type fleetRemovalEvent struct {
+	Type      string `json:"type"`
+	VehicleID string `json:"vehicleId"`
+}
+
+func (r *databaseRepository) listenForChanges(ctx context.Context, hub *databaseSimulator) {
+	for ctx.Err() == nil {
+		if err := r.listenOnce(ctx, hub); err != nil && ctx.Err() == nil {
+			log.Printf("database notification listener stopped: %v; retrying", err)
+			timer := time.NewTimer(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+	}
+}
+
+func (r *databaseRepository) listenOnce(ctx context.Context, hub *databaseSimulator) error {
+	config, err := pgx.ParseConfig(r.databaseURL)
+	if err != nil {
+		return fmt.Errorf("parse notification connection: %w", err)
+	}
+	if config.RuntimeParams == nil {
+		config.RuntimeParams = map[string]string{}
+	}
+	config.RuntimeParams["search_path"] = databaseQuoteIdentifier(r.schema) + ",public"
+	conn, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		return fmt.Errorf("connect notification listener: %w", err)
+	}
+	defer conn.Close(context.Background())
+	if _, err := conn.Exec(ctx, "LISTEN "+realtimeNotificationChannel); err != nil {
+		return fmt.Errorf("listen for database changes: %w", err)
+	}
+	log.Printf("listening for PostgreSQL changes on %s", realtimeNotificationChannel)
+
+	for {
+		notification, err := conn.WaitForNotification(ctx)
+		if err != nil {
+			return err
+		}
+		r.publishDatabaseChange(ctx, notification.Payload, hub)
+	}
+}
+
+func (r *databaseRepository) publishDatabaseChange(ctx context.Context, changedVehicleID string, hub *databaseSimulator) {
+	if changedVehicleID == "refresh" {
+		items, err := r.snapshot(ctx)
+		if err != nil {
+			log.Printf("read fleet after database change: %v", err)
+			return
+		}
+		payload, err := json.Marshal(fleetEvent{Type: "fleet-snapshot", Vehicles: items})
+		if err == nil {
+			hub.publish(payload)
+		}
+		return
+	}
+
+	item, err := r.vehicleSnapshot(ctx, changedVehicleID)
+	if err != nil {
+		log.Printf("read vehicle after database change: %v", err)
+		return
+	}
+	if item == nil {
+		payload, err := json.Marshal(fleetRemovalEvent{Type: "vehicle-removed", VehicleID: changedVehicleID})
+		if err == nil {
+			hub.publish(payload)
+		}
+		return
+	}
+	payload, err := json.Marshal(fleetEvent{Type: "vehicle-updates", Vehicles: []vehicle{*item}})
+	if err == nil {
+		hub.publish(payload)
+	}
+}
+
 func (s *databaseSimulator) tick(ctx context.Context) {
 	items, err := s.repository.snapshot(ctx)
 	if err != nil {
@@ -355,7 +459,6 @@ func (s *databaseSimulator) tick(ctx context.Context) {
 		return
 	}
 	batchSize := min(databaseSimulationBatchSize, len(items))
-	updates := make([]vehicle, 0, batchSize)
 	for range batchSize {
 		item := items[s.random.IntN(len(items))]
 		s.advance(&item)
@@ -363,14 +466,6 @@ func (s *databaseSimulator) tick(ctx context.Context) {
 			log.Printf("store position for %s: %v", item.Code, err)
 			continue
 		}
-		updates = append(updates, item)
-	}
-	if len(updates) == 0 {
-		return
-	}
-	payload, err := json.Marshal(fleetEvent{Type: "vehicle-updates", Vehicles: updates})
-	if err == nil {
-		s.publish(payload)
 	}
 }
 
@@ -408,6 +503,10 @@ func (s *databaseSimulator) run(ctx context.Context) {
 	}
 }
 
+func simulatorEnabled() bool {
+	return strings.EqualFold(os.Getenv("SIMULATOR_ENABLED"), "true")
+}
+
 func writeDatabaseJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -440,7 +539,13 @@ func main() {
 		log.Printf("seeded %d demo vehicles", databaseDemoFleetSize)
 	}
 	sim := newDatabaseSimulator(repository)
-	go sim.run(ctx)
+	go repository.listenForChanges(ctx, sim)
+	if simulatorEnabled() {
+		log.Print("database simulator is enabled")
+		go sim.run(ctx)
+	} else {
+		log.Print("database simulator is disabled; PostgreSQL writes drive realtime updates")
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", withCORS(func(w http.ResponseWriter, r *http.Request) {

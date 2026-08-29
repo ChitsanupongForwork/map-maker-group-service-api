@@ -6,7 +6,7 @@ services:
     startCommand: ./app
     healthCheckPath: /healthz
     envVars:
-      - key: DEMO_MODE
-        value: "true"
+      - key: SIMULATOR_ENABLED
+        value: "false"
       - key: FRONTEND_ORIGINS
         value: https://map-maker-group.vercel.app
