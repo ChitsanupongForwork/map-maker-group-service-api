@@ -4,3 +4,4 @@
 .appdeploy
 fleet-api.exe
 bin/
+tmp/

@@ -1,0 +1,528 @@
+{
+  "info": {
+    "name": "Map Maker Service API",
+    "description": "ทดสอบ API ของหน้า /map และ /history ตาม API-REQUIREMENTS.md — แต่ละ request มี Tests ที่ไล่เช็กลิสต์หัวข้อ 11 ให้อัตโนมัติ ดูผลที่แท็บ Test Results. โฟลเดอร์ 4 (Ingest) ต้องมีฐานข้อมูล ถ้ารันโหมด demo จะได้ 503",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8080" },
+    { "key": "vehicleId", "value": "v-0001" },
+    { "key": "from", "value": "" },
+    { "key": "to", "value": "" },
+    { "key": "recordedAt", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "1. Health",
+      "item": [
+        {
+          "name": "GET /healthz",
+          "request": { "method": "GET", "url": "{{baseUrl}}/healthz" },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('status is ok and mode is reported', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.status).to.eql('ok');",
+                  "  pm.expect(['demo', 'postgres']).to.include(body.mode);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. Fleet (/map)",
+      "item": [
+        {
+          "name": "GET /api/fleet",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/fleet" },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const isEpochMs = (v) => Number.isInteger(v) && String(v).length === 13;",
+                  "const STATUSES = ['running', 'engine-on', 'parking', 'offline'];",
+                  "",
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('vehicles is an array and generatedAt exists', () => {",
+                  "  pm.expect(body.vehicles).to.be.an('array').that.is.not.empty;",
+                  "  pm.expect(isEpochMs(body.generatedAt), 'generatedAt 13 digits').to.be.true;",
+                  "});",
+                  "pm.test('no field is null', () => pm.expect(pm.response.text()).to.not.include('null'));",
+                  "pm.test('lastUpdate is 13-digit epoch ms (10 digits = seconds = wrong)', () => {",
+                  "  body.vehicles.forEach((v) => pm.expect(isEpochMs(v.lastUpdate), v.id).to.be.true);",
+                  "});",
+                  "pm.test('status is one of the 4 allowed values', () => {",
+                  "  body.vehicles.forEach((v) => pm.expect(STATUSES, v.id).to.include(v.status));",
+                  "});",
+                  "pm.test('headingDeg is 0–359', () => {",
+                  "  body.vehicles.forEach((v) => pm.expect(v.headingDeg, v.id).to.be.within(0, 359));",
+                  "});",
+                  "pm.test('groupId / areaId / driverId exist in options', () => {",
+                  "  const ids = (list) => new Set(list.map((o) => o.value));",
+                  "  const groups = ids(body.groups), areas = ids(body.areas), drivers = ids(body.drivers);",
+                  "  body.vehicles.forEach((v) => {",
+                  "    pm.expect(groups.has(v.groupId), v.id + ' groupId').to.be.true;",
+                  "    pm.expect(areas.has(v.areaId), v.id + ' areaId').to.be.true;",
+                  "    pm.expect(drivers.has(v.driverId), v.id + ' driverId').to.be.true;",
+                  "  });",
+                  "});",
+                  "pm.test('speedHistory is an array', () => {",
+                  "  body.vehicles.forEach((v) => pm.expect(v.speedHistory, v.id).to.be.an('array'));",
+                  "});",
+                  "",
+                  "// เก็บ id คันแรกไว้ใช้กับโฟลเดอร์ History",
+                  "if (body.vehicles && body.vehicles.length) {",
+                  "  pm.collectionVariables.set('vehicleId', body.vehicles[0].id);",
+                  "}",
+                  "const count = {};",
+                  "body.vehicles.forEach((v) => { count[v.status] = (count[v.status] || 0) + 1; });",
+                  "console.log('vehicles by status', count);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET /api/fleet/stream (SSE)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "text/event-stream" }],
+            "url": "{{baseUrl}}/api/fleet/stream",
+            "description": "สายนี้เปิดค้าง — Postman จะแสดง event สด ๆ จนกว่าจะกด Cancel. สิ่งที่ควรเห็น: event snapshot ก้อนเต็ม 1 ครั้งทันทีที่ต่อ, ตามด้วย event patch ทุก ~3 วินาที (มีแต่ id + ฟิลด์ที่เปลี่ยน), และ comment heartbeat ทุก 20 วินาทีตอนเงียบ. ใน terminal ใช้ curl.exe -N {{baseUrl}}/api/fleet/stream ก็ได้"
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. History (/history)",
+      "item": [
+        {
+          "name": "GET history — last 24 hours",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/vehicles/{{vehicleId}}/history?from={{from}}&to={{to}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "vehicles", "{{vehicleId}}", "history"],
+              "query": [
+                { "key": "from", "value": "{{from}}" },
+                { "key": "to", "value": "{{to}}" }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const now = Date.now();",
+                  "pm.collectionVariables.set('to', now);",
+                  "pm.collectionVariables.set('from', now - 24 * 60 * 60 * 1000);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('responds within 1 second', () => pm.expect(pm.response.responseTime).to.be.below(1000));",
+                  "pm.test('no field is null', () => pm.expect(pm.response.text()).to.not.include('null'));",
+                  "pm.test('points ≤ 5000 and in time order', () => {",
+                  "  pm.expect(body.points).to.be.an('array');",
+                  "  pm.expect(body.points.length).to.be.at.most(5000);",
+                  "  for (let i = 1; i < body.points.length; i++) {",
+                  "    pm.expect(body.points[i].timestamp).to.be.above(body.points[i - 1].timestamp);",
+                  "  }",
+                  "});",
+                  "pm.test('events point at existing points', () => {",
+                  "  body.events.forEach((e) => {",
+                  "    pm.expect(['start', 'stop', 'moving', 'end']).to.include(e.type);",
+                  "    pm.expect(e.pointIndex).to.be.within(0, body.points.length - 1);",
+                  "    pm.expect(body.points[e.pointIndex].timestamp, e.id).to.eql(e.timestamp);",
+                  "  });",
+                  "});",
+                  "pm.test('summary fields are numbers', () => {",
+                  "  ['distanceKm', 'movingMinutes', 'stoppedMinutes', 'maxSpeedKph', 'averageSpeedKph']",
+                  "    .forEach((key) => pm.expect(body[key], key).to.be.a('number'));",
+                  "});",
+                  "console.log('points', body.points.length, 'events', body.events.length, 'km', body.distanceKm);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET history — today since midnight (UI default)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/vehicles/{{vehicleId}}/history?from={{from}}&to={{to}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "vehicles", "{{vehicleId}}", "history"],
+              "query": [
+                { "key": "from", "value": "{{from}}" },
+                { "key": "to", "value": "{{to}}" }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const midnight = new Date();",
+                  "midnight.setHours(0, 0, 0, 0);",
+                  "pm.collectionVariables.set('from', midnight.getTime());",
+                  "pm.collectionVariables.set('to', Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET history — full month (downsampled)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/vehicles/{{vehicleId}}/history?from={{from}}&to={{to}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "vehicles", "{{vehicleId}}", "history"],
+              "query": [
+                { "key": "from", "value": "{{from}}" },
+                { "key": "to", "value": "{{to}}" }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const now = Date.now();",
+                  "pm.collectionVariables.set('to', now);",
+                  "pm.collectionVariables.set('from', now - 31 * 24 * 60 * 60 * 1000);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('points ≤ 5000', () => pm.expect(pm.response.json().points.length).to.be.at.most(5000));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "400 — from/to in seconds instead of ms",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/vehicles/{{vehicleId}}/history?from=1789700000&to=1789765432"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+                  "pm.test('error explains milliseconds', () => pm.expect(pm.response.json().error).to.include('milliseconds'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "400 — range longer than 31 days",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/vehicles/{{vehicleId}}/history?from={{from}}&to={{to}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "vehicles", "{{vehicleId}}", "history"],
+              "query": [
+                { "key": "from", "value": "{{from}}" },
+                { "key": "to", "value": "{{to}}" }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const now = Date.now();",
+                  "pm.collectionVariables.set('to', now);",
+                  "pm.collectionVariables.set('from', now - 40 * 24 * 60 * 60 * 1000);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.test('400 Bad Request', () => pm.response.to.have.status(400));"]
+              }
+            }
+          ]
+        },
+        {
+          "name": "404 — unknown vehicle",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/api/vehicles/v-9999/history?from={{from}}&to={{to}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "vehicles", "v-9999", "history"],
+              "query": [
+                { "key": "from", "value": "{{from}}" },
+                { "key": "to", "value": "{{to}}" }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const now = Date.now();",
+                  "pm.collectionVariables.set('to', now);",
+                  "pm.collectionVariables.set('from', now - 60 * 60 * 1000);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.test('404 Not Found', () => pm.response.to.have.status(404));"]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4. Ingest (needs database)",
+      "description": "รันเรียงจากบนลงล่าง — request ที่ 2 และ 3 ใช้ recordedAt ที่ request แรกตั้งไว้ เพื่อพิสูจน์เช็กลิสต์ 'ยิงจุดเดิมซ้ำไม่เกิดแถวซ้ำ' และ 'จุดเก่าไม่เขียนทับ live_state'. ใช้กับรถที่มีอยู่จริงในตาราง vehicles (ค่าเริ่มต้น v-0001 จาก 002_seed_demo.sql)",
+      "item": [
+        {
+          "name": "POST one position (now)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{baseUrl}}/api/positions",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vehicleId\": \"{{vehicleId}}\",\n  \"recordedAt\": {{recordedAt}},\n  \"lat\": 13.80150,\n  \"lng\": 100.55440,\n  \"speedKph\": 71,\n  \"headingDeg\": 287,\n  \"ignitionOn\": true,\n  \"fuelPct\": 67,\n  \"address\": \"ถนนพหลโยธิน แขวงจอมพล เขตจตุจักร กรุงเทพมหานคร\"\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.collectionVariables.set('recordedAt', Date.now());"]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('inserted into position_events and live state', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.inserted).to.eql(1);",
+                  "  pm.expect(body.liveStateUpdated).to.eql(1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST same position again → duplicate",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{baseUrl}}/api/positions",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vehicleId\": \"{{vehicleId}}\",\n  \"recordedAt\": {{recordedAt}},\n  \"lat\": 13.80150,\n  \"lng\": 100.55440,\n  \"speedKph\": 71,\n  \"headingDeg\": 287,\n  \"ignitionOn\": true\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('no duplicate row, live state untouched', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.inserted).to.eql(0);",
+                  "  pm.expect(body.duplicates).to.eql(1);",
+                  "  pm.expect(body.liveStateUpdated).to.eql(0);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST older position (late arrival) → history only",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{baseUrl}}/api/positions",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vehicleId\": \"{{vehicleId}}\",\n  \"recordedAt\": {{olderRecordedAt}},\n  \"lat\": 13.79900,\n  \"lng\": 100.55800,\n  \"speedKph\": 55,\n  \"headingDeg\": 290,\n  \"ignitionOn\": true\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// 10 นาทีก่อนจุดของ request แรก — เหมือนรถออกจากอุโมงค์แล้วส่งจุดที่ค้างไว้",
+                  "pm.variables.set('olderRecordedAt', Number(pm.collectionVariables.get('recordedAt')) - 10 * 60 * 1000);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('stored in history but did not overwrite newer live state', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.inserted).to.eql(1);",
+                  "  pm.expect(body.liveStateUpdated).to.eql(0);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST batch (array of positions)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{baseUrl}}/api/positions",
+            "body": {
+              "mode": "raw",
+              "raw": "[\n  { \"vehicleId\": \"{{vehicleId}}\", \"recordedAt\": {{t1}}, \"lat\": 13.80200, \"lng\": 100.55300, \"speedKph\": 60, \"headingDeg\": 290, \"ignitionOn\": true },\n  { \"vehicleId\": \"{{vehicleId}}\", \"recordedAt\": {{t2}}, \"lat\": 13.80250, \"lng\": 100.55160, \"speedKph\": 64, \"headingDeg\": 291, \"ignitionOn\": true },\n  { \"vehicleId\": \"{{vehicleId}}\", \"recordedAt\": {{t3}}, \"lat\": 13.80300, \"lng\": 100.55020, \"speedKph\": 0, \"headingDeg\": 291, \"ignitionOn\": false }\n]",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const now = Date.now();",
+                  "pm.variables.set('t1', now - 20000);",
+                  "pm.variables.set('t2', now - 10000);",
+                  "pm.variables.set('t3', now);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('all 3 stored', () => pm.expect(pm.response.json().inserted).to.eql(3));",
+                  "// ตอนนี้ GET /api/fleet ควรเห็นคันนี้เป็น parking (จุดสุดท้ายดับเครื่อง)"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "400 — headingDeg 360",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{baseUrl}}/api/positions",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vehicleId\": \"{{vehicleId}}\",\n  \"recordedAt\": {{$timestamp}}000,\n  \"lat\": 13.8,\n  \"lng\": 100.55,\n  \"speedKph\": 40,\n  \"headingDeg\": 360,\n  \"ignitionOn\": true\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.test('400 Bad Request', () => pm.response.to.have.status(400));"]
+              }
+            }
+          ]
+        },
+        {
+          "name": "422 — unknown vehicle",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{baseUrl}}/api/positions",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"vehicleId\": \"v-does-not-exist\",\n  \"recordedAt\": {{$timestamp}}000,\n  \"lat\": 13.8,\n  \"lng\": 100.55,\n  \"speedKph\": 40,\n  \"headingDeg\": 90,\n  \"ignitionOn\": true\n}",
+              "options": { "raw": { "language": "json" } }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.test('422 Unprocessable Entity', () => pm.response.to.have.status(422));"]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
